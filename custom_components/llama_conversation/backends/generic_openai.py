@@ -2,14 +2,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
-from typing import List, Dict, Tuple, AsyncGenerator, Any, Optional
+import re
+from dataclasses import replace
+from functools import partial
+from typing import List, Dict, Tuple, AsyncGenerator, Any, Callable, Optional
 
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.components import conversation
 from homeassistant.const import CONF_HOST, CONF_PORT, CONF_SSL
-from homeassistant.helpers import llm
+from homeassistant.helpers import config_validation as cv, intent, llm
 from openai import AsyncOpenAI, OpenAIError
 
 # openai 3.x resolves resource classes through module level __getattr__ hooks that
@@ -39,6 +44,7 @@ from custom_components.llama_conversation.const import (
     DEFAULT_ENABLE_LEGACY_TOOL_CALLING,
     DEFAULT_TOOL_RESPONSE_AS_STRING,
     RECOMMENDED_CHAT_MODELS,
+    SERVICE_TOOL_NAME,
 )
 from custom_components.llama_conversation.entity import TextGenerationResult, LocalLLMClient
 
@@ -51,6 +57,145 @@ NO_API_KEY_PLACEHOLDER = "sk-none"
 def _api_key_from_options(client_options: dict[str, Any]) -> str:
     """Return the configured API key or the placeholder when the server needs no key."""
     return client_options.get(CONF_API_KEY) or NO_API_KEY_PLACEHOLDER
+
+
+_TOOL_NAME = re.compile(r"[a-zA-Z0-9_-]{1,64}")
+
+
+def _serialize_ha_validator(fallback: Callable[[Any], Any], validator: Any) -> Any:
+    """Backport HA's typed serialization for common Voluptuous validators."""
+    if validator is cv.boolean:
+        return {"type": "boolean"}
+    if any(validator is item for item in (
+        cv.string, intent.non_empty_string, cv.entity_id, cv.entity_id_or_uuid,
+        cv.strict_entity_id, cv.service,
+    )):
+        return {"type": "string"}
+    return fallback(validator)
+
+
+def _strict_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Convert a HA tool schema to the strict wire format."""
+    result = {key: value for key, value in schema.items() if key != "default"}
+    if schema.get("type") == "object":
+        required = set(schema.get("required", ()))
+        properties = {}
+        for key, value in schema.get("properties", {}).items():
+            property_schema = _strict_tool_schema(value)
+            if key not in required:
+                property_schema = {"anyOf": [property_schema, {"type": "null"}]}
+            properties[key] = property_schema
+        result.update(
+            properties=properties,
+            required=list(properties),
+            additionalProperties=False,
+        )
+    if isinstance(schema.get("items"), dict):
+        result["items"] = _strict_tool_schema(schema["items"])
+    for key in ("anyOf", "oneOf", "allOf"):
+        if key not in schema:
+            continue
+        branches = schema[key]
+        if (
+            key == "anyOf" and schema.get("type") == "object" and branches
+            and all(set(branch) == {"required"} for branch in branches)
+        ):
+            # Voluptuous uses these branches for presence groups (e.g. timer duration).
+            # HA still validates the group after omitted optional fields are restored.
+            choices = " or ".join(" and ".join(branch["required"]) for branch in branches)
+            guidance = f"Provide non-null values for {choices}."
+            result["description"] = f'{result.get("description", "")} {guidance}'.strip()
+            result.pop(key)
+        else:
+            result[key] = [_strict_tool_schema(value) for value in branches]
+    return result
+
+
+def _omit_optional_nulls(value: Any, schema: dict[str, Any]) -> Any:
+    """Restore omitted optional HA arguments from the strict wire format."""
+    if isinstance(value, dict):
+        properties = schema.get("properties", {})
+        required = set(schema.get("required", ()))
+        return {
+            key: _omit_optional_nulls(item, properties.get(key, {}))
+            for key, item in value.items()
+            if item is not None or key in required or key not in properties
+        }
+    if isinstance(value, list) and isinstance(schema.get("items"), dict):
+        return [_omit_optional_nulls(item, schema["items"]) for item in value]
+    return value
+
+
+class _ChatCompletionTools:
+    """Keep provider tool names and schemas separate from HA tool dispatch."""
+
+    def __init__(self, tools: list[dict[str, Any]]) -> None:
+        self.specs: list[dict[str, Any]] = []
+        self._by_alias: dict[str, dict[str, Any]] = {}
+        self._aliases: dict[str, str] = {}
+        reserved_names = {
+            tool["function"]["name"]
+            for tool in tools
+            if _TOOL_NAME.fullmatch(tool["function"]["name"])
+        }
+        for tool in tools:
+            function = tool["function"]
+            name = function["name"]
+            alias = name
+            if not _TOOL_NAME.fullmatch(name):
+                stem = re.sub(r"[^a-zA-Z0-9_-]", "_", name)[:40]
+                suffix = hashlib.sha256(name.encode()).hexdigest()[:16]
+                alias = f"{stem}_{suffix}"
+                collision = 0
+                while alias in reserved_names or alias in self._by_alias:
+                    collision += 1
+                    alias = f"{stem}_{suffix}_{collision}"
+            self._aliases[name] = alias
+            self._by_alias[alias] = function
+            self.specs.append({
+                **tool,
+                "function": {
+                    **function,
+                    "name": alias,
+                    "parameters": _strict_tool_schema(function["parameters"]),
+                },
+            })
+
+    def decode(self, name: str, arguments: str | dict | None) -> dict:
+        """Return a tool call in the original HA format."""
+        function = self._by_alias.get(name)
+        if function is not None:
+            name = function["name"]
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except ValueError:
+                    pass  # The existing HA parser can try to repair the JSON.
+            if isinstance(arguments, dict):
+                arguments = _omit_optional_nulls(arguments, function["parameters"])
+        return {"function": {"name": name, "arguments": arguments}}
+
+    def encode_history(self, messages: list[dict[str, Any]]) -> None:
+        """Use the same alias for the recorded call and its result."""
+        calls: dict[str, str] = {}
+        for message in messages:
+            if message["role"] == "assistant":
+                for call in message.get("tool_calls", []):
+                    function = call["function"]
+                    name = function["name"]
+                    if name.endswith(SERVICE_TOOL_NAME):
+                        arguments = json.loads(function["arguments"])
+                        service = arguments.get("service")
+                        if isinstance(service, str) and service in self._aliases:
+                            name = service
+                            arguments.pop("service")
+                            function["arguments"] = json.dumps(arguments)
+                    if name in self._aliases:
+                        function["name"] = self._aliases[name]
+                        calls[call["id"]] = function["name"]
+            elif message["role"] == "tool" and message["tool_call_id"] in calls:
+                message["name"] = calls[message["tool_call_id"]]
+
 
 def _extra_headers_from_options(client_options: dict[str, Any]) -> dict[str, str]:
     try:
@@ -117,6 +262,35 @@ class GenericOpenAIAPIClient(LocalLLMClient):
             _LOGGER.exception("Failed to get available models")
             return RECOMMENDED_CHAT_MODELS
 
+    def _prepare_chat_input(
+        self,
+        conversation: List[conversation.Content],
+        llm_api: llm.APIInstance | None,
+        entity_options: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], _ChatCompletionTools]:
+        messages = get_oai_formatted_messages(
+            conversation,
+            user_content_as_list=True,
+            tool_result_to_str=entity_options.get(
+                CONF_TOOL_RESPONSE_AS_STRING, DEFAULT_TOOL_RESPONSE_AS_STRING
+            ),
+        )
+        legacy = entity_options.get(
+            CONF_ENABLE_LEGACY_TOOL_CALLING, DEFAULT_ENABLE_LEGACY_TOOL_CALLING
+        )
+        raw_tools = []
+        if llm_api and not legacy:
+            if llm_api.custom_serializer is not None:
+                llm_api = replace(
+                    llm_api,
+                    custom_serializer=partial(_serialize_ha_validator, llm_api.custom_serializer),
+                )
+            raw_tools = get_oai_formatted_tools(llm_api, self._async_get_all_exposed_domains())
+        tools = _ChatCompletionTools(raw_tools)
+        if tools.specs:
+            tools.encode_history(messages)
+        return messages, tools
+
     def _generate_stream(self, 
                          conversation: List[conversation.Content],
                          llm_api: llm.APIInstance | None,
@@ -126,11 +300,8 @@ class GenericOpenAIAPIClient(LocalLLMClient):
         model_name = entity_options[CONF_CHAT_MODEL]
         max_tokens = entity_options.get(CONF_MAX_TOKENS, DEFAULT_MAX_TOKENS)
         timeout = entity_options.get(CONF_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT)
-        enable_legacy_tool_calling = entity_options.get(CONF_ENABLE_LEGACY_TOOL_CALLING, DEFAULT_ENABLE_LEGACY_TOOL_CALLING)
-        tool_response_as_string = entity_options.get(CONF_TOOL_RESPONSE_AS_STRING, DEFAULT_TOOL_RESPONSE_AS_STRING)
-
         _, additional_params = self._chat_completion_params(entity_options)
-        messages = get_oai_formatted_messages(conversation, user_content_as_list=True, tool_result_to_str=tool_response_as_string)
+        messages, tools = self._prepare_chat_input(conversation, llm_api, entity_options)
 
         request_params = {
             "model": model_name,
@@ -154,12 +325,10 @@ class GenericOpenAIAPIClient(LocalLLMClient):
                 },
             }
 
-        tools = None
-        if llm_api and not enable_legacy_tool_calling:
-            tools = get_oai_formatted_tools(llm_api, self._async_get_all_exposed_domains())
-            request_params["tools"] = tools
+        if tools.specs:
+            request_params["tools"] = tools.specs
 
-        _LOGGER.debug(f"Generating completion with {len(messages)} messages and {len(tools) if tools else 0} tools...")
+        _LOGGER.debug("Generating completion with %s messages and %s tools", len(messages), len(tools.specs))
 
         async def anext_token() -> AsyncGenerator[Tuple[Optional[str], Optional[List[dict]]], None]:
             try:                    
@@ -169,7 +338,7 @@ class GenericOpenAIAPIClient(LocalLLMClient):
                             if event.type == "content.delta": # normal text chunks we can yield
                                 yield event.delta, None
                             elif event.type == "tool_calls.function.arguments.done": # function calls need to wait until complete to be yielded
-                                yield None, [{"function": {"name": event.name, "arguments": event.parsed_arguments}}]
+                                yield None, [tools.decode(event.name, event.parsed_arguments or event.arguments)]
             except asyncio.TimeoutError as err:
                 _LOGGER.debug("OpenAI API timeout during streaming generation: params=%s, error=%s", request_params, err)
                 raise HomeAssistantError("The generation request timed out! Please check your connection settings, increase the timeout in settings, or decrease the number of exposed entities.") from err
@@ -189,11 +358,8 @@ class GenericOpenAIAPIClient(LocalLLMClient):
         model_name = entity_options[CONF_CHAT_MODEL]
         max_tokens = entity_options.get(CONF_MAX_TOKENS, DEFAULT_MAX_TOKENS)
         timeout = entity_options.get(CONF_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT)
-        enable_legacy_tool_calling = entity_options.get(CONF_ENABLE_LEGACY_TOOL_CALLING, DEFAULT_ENABLE_LEGACY_TOOL_CALLING)
-        tool_response_as_string = entity_options.get(CONF_TOOL_RESPONSE_AS_STRING, DEFAULT_TOOL_RESPONSE_AS_STRING)
-
-        endpoint, additional_params = self._chat_completion_params(entity_options)
-        messages = get_oai_formatted_messages(conversation, user_content_as_list=True, tool_result_to_str=tool_response_as_string)
+        _, additional_params = self._chat_completion_params(entity_options)
+        messages, tools = self._prepare_chat_input(conversation, llm_api, entity_options)
 
         request_params: Dict[str, Any] = {
             "model": model_name,
@@ -216,8 +382,8 @@ class GenericOpenAIAPIClient(LocalLLMClient):
                 },
             }
 
-        if llm_api and not enable_legacy_tool_calling:
-            request_params["tools"] = get_oai_formatted_tools(llm_api, self._async_get_all_exposed_domains())
+        if tools.specs:
+            request_params["tools"] = tools.specs
 
         _LOGGER.debug(f"Generating non-stream completion with {len(messages)} messages...")
 
@@ -252,12 +418,7 @@ class GenericOpenAIAPIClient(LocalLLMClient):
                 if not function:
                     continue
                 raw_tool_calls.append(
-                    {
-                        "function": {
-                            "name": getattr(function, "name", ""),
-                            "arguments": getattr(function, "arguments", "{}"),
-                        }
-                    }
+                    tools.decode(function.name, function.arguments)
                 )
 
         async def single_chunk() -> AsyncGenerator[Tuple[Optional[str], Optional[List[dict]]], None]:
